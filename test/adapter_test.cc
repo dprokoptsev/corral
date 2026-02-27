@@ -1009,6 +1009,54 @@ CORRAL_TEST_CASE("with-immediate-cancel") {
     CATCH_CHECK(t.now() == 2ms);
 }
 
+// If the enclosing task is *not* immediately-cancellable,
+// neither is with().
+CORRAL_TEST_CASE("with-immediate-cancel-rejected") {
+    StageChecker stage;
+    co_await anyOf(t.sleep(1ms), [&]() -> Task<> {
+        co_await noncancellable(t.sleep(2ms));
+        stage.require(0);
+        co_await with(
+                [&](TaskStarted<> started) -> Task<> {
+                    co_await noncancellable(t.sleep(1ms));
+                    stage.require(1);
+                    co_await suspendForever;
+                },
+                [&]() -> Task<> {
+                    CATCH_CHECK(!"should not be reached");
+                    co_await t.sleep(1ms);
+                });
+    });
+    stage.require(2);
+    CATCH_CHECK(t.now() == 3ms);
+}
+
+
+// There has been a bug when external cancellation arriving between With's
+// second stage completion and first stage completion led to With prematurely
+// confirming cancellation.
+CORRAL_TEST_CASE("with-complete-cancel") {
+    StageChecker stage;
+    co_await anyOf(
+            [&]() -> Task<> {
+                co_await t.sleep(2ms);
+                stage.require(2);
+            },
+            with(
+                    [&](TaskStarted<> started) -> Task<> {
+                        stage.require(0);
+                        started();
+                        co_await noncancellable(t.sleep(3ms));
+                        stage.require(3);
+                        co_await yield; // cancellation point
+                    },
+                    [&]() -> Task<> {
+                        stage.require(1);
+                        co_await t.sleep(1ms);
+                    }));
+    CATCH_CHECK(t.now() == 3ms);
+}
+
 // A weird use case: readiness is signalled synchronously during first stage's
 // cancellation (before await_cancel() returns).
 CORRAL_TEST_CASE("with-ready-on-cancel") {
@@ -1033,7 +1081,6 @@ CORRAL_TEST_CASE("with-ready-on-cancel") {
                     }));
     stage.require(2);
 }
-
 
 //
 // Miscellanea

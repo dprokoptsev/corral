@@ -161,6 +161,9 @@ class With : private TaskStartedSink<IntermediateResult<FirstFn>>,
     template <class S> bool mustStageResume() const noexcept {
         return !(flags_ & (StageMustNotResume << S::Shift));
     }
+    template <class S> bool isStageRunning() const noexcept {
+        return isStageStarted<S>() && !isStageDone<S>();
+    }
     template <class S> void markStageStarted() noexcept {
         flags_ |= (StageStarted << S::Shift);
     }
@@ -277,34 +280,37 @@ class With : private TaskStartedSink<IntermediateResult<FirstFn>>,
         auto& awaiter = S::get(*this).awaiter;
         if (isStageDone<S>()) {
             return noopHandle();
-        } else if (awaiter.await_ready()) {
-            return onStageDone<S>();
-        } else {
-            if (flags_ & Cancelling) {
-                markStageCancelling<S>();
-                if (awaiter.await_early_cancel()) {
-                    return onStageDone<S>();
-                }
-            }
+        }
 
-            markStageStarted<S>();
-            CoroutineFrame* frame = S::frame(*this);
-            frame->resumeFn = +[](CoroutineFrame* fr) {
-                S::fromFrame(fr).template onStageDone<S>().resume();
-            };
-
-#if __cpp_exceptions
-            try {
-#endif
-                return awaiter.await_suspend(frame->toHandle());
-#if __cpp_exceptions
-            } catch (...) {
-                this->template switchTo<With::Stage::Exception>(
-                        std::current_exception());
+        if ((flags_ & Cancelling) && !isStageCancelling<S>()) {
+            markStageCancelling<S>();
+            if (awaiter.await_early_cancel()) {
+                markStageMustNotResume<S>();
                 return onStageDone<S>();
             }
-#endif
         }
+
+        if (awaiter.await_ready()) {
+            return onStageDone<S>();
+        }
+
+        markStageStarted<S>();
+        CoroutineFrame* frame = S::frame(*this);
+        frame->resumeFn = +[](CoroutineFrame* fr) {
+            S::fromFrame(fr).template onStageDone<S>().resume();
+        };
+
+#if __cpp_exceptions
+        try {
+#endif
+            return awaiter.await_suspend(frame->toHandle());
+#if __cpp_exceptions
+        } catch (...) {
+            this->template switchTo<With::Stage::Exception>(
+                    std::current_exception());
+            return onStageDone<S>();
+        }
+#endif
     }
 
     template <class S> bool cancelStage() noexcept {
@@ -391,15 +397,13 @@ class With : private TaskStartedSink<IntermediateResult<FirstFn>>,
 
     bool doCancel() {
         flags_ |= Cancelling;
-        if (this->inSecondStage()) {
+        if (isStageRunning<SecondStage>()) {
             return cancelStage<SecondStage>() && cancelStage<FirstStage>();
             // Note: bool eval short-circuiting is essential here
             // (first stage's cancellation should not commence until second
             // stage completes)
-        } else if (!this->inFirstStage()) {
-            return true;
         } else {
-            return (cancelStage<FirstStage>() && !this->inSecondStage());
+            return cancelStage<FirstStage>() && !isStageRunning<SecondStage>();
         }
     }
 
